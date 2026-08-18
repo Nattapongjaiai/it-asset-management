@@ -2,7 +2,9 @@ import { useState, useEffect, useMemo } from "react";
 import {
   Wrench, Boxes, Building2, LayoutDashboard, Plus, Search, X, AlertTriangle,
   CheckCircle2, PackageX, Trash2, Pencil, ImagePlus, Loader2, Image as ImageIcon,
+  Upload, Download, FileSpreadsheet, CheckCircle, AlertCircle,
 } from "lucide-react";
+import * as XLSX from "xlsx";
 import { supabase } from "./supabaseClient";
 
 // ---------- constants ----------
@@ -114,6 +116,17 @@ export default function App() {
     const { error } = await supabase.from("assets").delete().eq("id", id);
     if (error) return alert("ลบไม่สำเร็จ: " + error.message);
     fetchAll();
+  };
+  const addAssetsBulk = async (rows) => {
+    const payload = rows.map((r) => assetToDb({ ...r, id: uid("as") }));
+    // insert in chunks of 300 to stay safely under request limits for large excel imports
+    for (let i = 0; i < payload.length; i += 300) {
+      const chunk = payload.slice(i, i + 300);
+      const { error } = await supabase.from("assets").insert(chunk);
+      if (error) { alert("นำเข้าไม่สำเร็จ (แถวที่ " + (i + 1) + " เป็นต้นไป): " + error.message); return false; }
+    }
+    await fetchAll();
+    return true;
   };
 
   // ---------- branches ----------
@@ -227,7 +240,7 @@ export default function App() {
         ) : tab === "dashboard" ? (
           <Dashboard assets={assets} branches={branches} tickets={tickets} branchName={branchName} setTab={setTab} />
         ) : tab === "assets" ? (
-          <AssetsView assets={assets} branches={branches} branchName={branchName} onAdd={addAsset} onEdit={editAsset} onDelete={deleteAsset} />
+          <AssetsView assets={assets} branches={branches} branchName={branchName} onAdd={addAsset} onEdit={editAsset} onDelete={deleteAsset} onAddBulk={addAssetsBulk} />
         ) : tab === "tickets" ? (
           <TicketsView tickets={tickets} assets={assets} branches={branches} branchName={branchName} assetLabel={assetLabel}
             onCreate={createTicket} onStatus={updateTicketStatus} onDelete={deleteTicket}
@@ -343,11 +356,12 @@ function Dashboard({ assets, branches, tickets, branchName, setTab }) {
 }
 
 // ================= ASSETS =================
-function AssetsView({ assets, branches, branchName, onAdd, onEdit, onDelete }) {
+function AssetsView({ assets, branches, branchName, onAdd, onEdit, onDelete, onAddBulk }) {
   const [q, setQ] = useState("");
   const [filterBranch, setFilterBranch] = useState("");
   const [filterStatus, setFilterStatus] = useState("");
   const [modal, setModal] = useState(null);
+  const [importOpen, setImportOpen] = useState(false);
 
   const filtered = assets.filter((a) => {
     const matchQ = !q || `${a.assetTag} ${a.brand} ${a.model} ${a.serial} ${a.assignedTo}`.toLowerCase().includes(q.toLowerCase());
@@ -369,7 +383,10 @@ function AssetsView({ assets, branches, branchName, onAdd, onEdit, onDelete }) {
           <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 2 }}>ทะเบียนทรัพย์สิน</h1>
           <p style={{ color: "var(--muted)", fontSize: 13.5 }}>สต็อกและอุปกรณ์ที่ใช้งานอยู่ทุกสาขา</p>
         </div>
-        <button className="btn btn-primary" onClick={() => setModal({ mode: "new", data: emptyAsset() })}><Plus size={15} /> เพิ่มทรัพย์สิน</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn" onClick={() => setImportOpen(true)}><Upload size={15} /> นำเข้าจาก Excel</button>
+          <button className="btn btn-primary" onClick={() => setModal({ mode: "new", data: emptyAsset() })}><Plus size={15} /> เพิ่มทรัพย์สิน</button>
+        </div>
       </div>
 
       <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
@@ -415,6 +432,7 @@ function AssetsView({ assets, branches, branchName, onAdd, onEdit, onDelete }) {
         </div>
       </div>
       {modal && <AssetModal mode={modal.mode} data={modal.data} branches={branches} onClose={() => setModal(null)} onSave={save} />}
+      {importOpen && <AssetImportModal branches={branches} onClose={() => setImportOpen(false)} onImport={onAddBulk} />}
     </div>
   );
 }
@@ -457,7 +475,187 @@ function AssetModal({ mode, data, branches, onClose, onSave }) {
   );
 }
 
-// ================= TICKETS =================
+// ---------- Excel / CSV bulk import for assets ----------
+const IMPORT_TEMPLATE_HEADERS = ["เลขครุภัณฑ์", "ประเภท", "ยี่ห้อ", "รุ่น", "Serial", "สาขา", "ผู้ใช้งาน", "สถานะ", "วันที่จัดซื้อ", "หมายเหตุ"];
+
+function downloadTemplate() {
+  const sample = [
+    ["PC-CM-0001", "คอมพิวเตอร์", "Dell", "OptiPlex 3090", "SN123456", "สาขาเชียงใหม่ 1", "สมชาย ใจดี", "ใช้งานอยู่", "2025-01-15", ""],
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([IMPORT_TEMPLATE_HEADERS, ...sample]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "assets");
+  XLSX.writeFile(wb, "เทมเพลตนำเข้าทรัพย์สิน.xlsx");
+}
+
+function normalizeStatus(v) {
+  const s = (v || "").toString().trim();
+  return ASSET_STATUS.includes(s) ? s : "ในสต็อก";
+}
+function normalizeType(v) {
+  const s = (v || "").toString().trim();
+  return ASSET_TYPES.includes(s) ? s : "อื่นๆ";
+}
+function normalizeDate(v) {
+  if (!v) return "";
+  if (v instanceof Date && !isNaN(v)) return v.toISOString().slice(0, 10);
+  const s = v.toString().trim();
+  // already yyyy-mm-dd
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = new Date(s);
+  return isNaN(d) ? "" : d.toISOString().slice(0, 10);
+}
+
+function AssetImportModal({ branches, onClose, onImport }) {
+  const [rows, setRows] = useState(null); // parsed + resolved rows
+  const [fileName, setFileName] = useState("");
+  const [parsing, setParsing] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [parseError, setParseError] = useState("");
+  const [done, setDone] = useState(false);
+
+  const branchByName = useMemo(() => {
+    const m = {};
+    branches.forEach((b) => { m[b.name.trim().toLowerCase()] = b.id; });
+    return m;
+  }, [branches]);
+
+  const handleFile = async (file) => {
+    if (!file) return;
+    setFileName(file.name);
+    setParsing(true);
+    setParseError("");
+    setDone(false);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array", cellDates: true });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const json = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      if (json.length === 0) { setParseError("ไม่พบข้อมูลในไฟล์ หรือไฟล์ไม่มีแถวข้อมูล"); setRows(null); return; }
+
+      const getCol = (row, ...names) => {
+        for (const n of names) {
+          const key = Object.keys(row).find((k) => k.trim().toLowerCase() === n.toLowerCase());
+          if (key !== undefined) return row[key];
+        }
+        return "";
+      };
+
+      const resolved = json.map((row, i) => {
+        const assetTag = getCol(row, "เลขครุภัณฑ์", "asset tag", "assettag").toString().trim();
+        const branchNameVal = getCol(row, "สาขา", "branch").toString().trim();
+        const branchId = branchByName[branchNameVal.toLowerCase()] || "";
+        return {
+          rowNum: i + 2, // +2 = header row + 1-index
+          assetTag,
+          type: normalizeType(getCol(row, "ประเภท", "type")),
+          brand: getCol(row, "ยี่ห้อ", "brand").toString().trim(),
+          model: getCol(row, "รุ่น", "model").toString().trim(),
+          serial: getCol(row, "Serial", "serial number", "serial").toString().trim(),
+          branchName: branchNameVal,
+          branchId,
+          assignedTo: getCol(row, "ผู้ใช้งาน", "assignedto").toString().trim(),
+          status: normalizeStatus(getCol(row, "สถานะ", "status")),
+          purchaseDate: normalizeDate(getCol(row, "วันที่จัดซื้อ", "purchasedate")),
+          notes: getCol(row, "หมายเหตุ", "notes").toString().trim(),
+        };
+      });
+      setRows(resolved);
+    } catch (e) {
+      console.error(e);
+      setParseError("อ่านไฟล์ไม่สำเร็จ ตรวจสอบว่าเป็นไฟล์ .xlsx, .xls หรือ .csv ที่ไม่เสียหาย");
+      setRows(null);
+    } finally {
+      setParsing(false);
+    }
+  };
+
+  const validRows = (rows || []).filter((r) => r.assetTag);
+  const invalidCount = (rows || []).length - validRows.length;
+  const unmatchedBranchCount = validRows.filter((r) => !r.branchId).length;
+
+  const confirmImport = async () => {
+    setImporting(true);
+    const ok = await onImport(validRows.map(({ rowNum, branchName, ...rest }) => rest));
+    setImporting(false);
+    if (ok !== false) setDone(true);
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" style={{ maxWidth: 640 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+          <div style={{ fontWeight: 700, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
+            <FileSpreadsheet size={17} style={{ color: "var(--accent)" }} /> นำเข้าทรัพย์สินจาก Excel / CSV
+          </div>
+          <X size={18} style={{ cursor: "pointer", color: "var(--muted)" }} onClick={onClose} />
+        </div>
+
+        {done ? (
+          <div style={{ textAlign: "center", padding: "30px 10px" }}>
+            <CheckCircle size={36} style={{ color: "#4ADE80", marginBottom: 10 }} />
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6 }}>นำเข้าสำเร็จ {validRows.length} รายการ</div>
+            <button className="btn btn-primary" onClick={onClose} style={{ marginTop: 10 }}>ปิดหน้าต่าง</button>
+          </div>
+        ) : (
+          <>
+            <p style={{ fontSize: 12.5, color: "var(--muted)", marginBottom: 12 }}>
+              ไฟล์ต้องมีคอลัมน์หัวตาราง: <span className="mono">{IMPORT_TEMPLATE_HEADERS.join(" · ")}</span> — ชื่อ "สาขา" ต้องสะกดตรงกับสาขาที่มีอยู่ในระบบ (เมนู "สาขา") จึงจะจับคู่ได้อัตโนมัติ
+            </p>
+            <button className="btn" onClick={downloadTemplate} style={{ marginBottom: 16 }}>
+              <Download size={14} /> ดาวน์โหลดไฟล์เทมเพลต
+            </button>
+
+            <label style={{
+              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6,
+              border: "1px dashed var(--line)", borderRadius: 10, padding: "26px 16px", cursor: "pointer", color: "var(--muted)", marginBottom: 14,
+            }}>
+              <Upload size={20} />
+              <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text)" }}>{fileName || "เลือกไฟล์ .xlsx / .xls / .csv"}</span>
+              <span style={{ fontSize: 11.5 }}>คลิกเพื่อเลือกไฟล์จากเครื่อง</span>
+              <input type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={(e) => handleFile(e.target.files?.[0])} />
+            </label>
+
+            {parsing && <div style={{ fontSize: 13, color: "var(--muted)", display: "flex", alignItems: "center", gap: 8 }}><Loader2 size={14} /> กำลังอ่านไฟล์…</div>}
+            {parseError && <div style={{ fontSize: 13, color: "#F87171", display: "flex", alignItems: "center", gap: 8 }}><AlertCircle size={14} /> {parseError}</div>}
+
+            {rows && !parsing && (
+              <>
+                <div style={{ display: "flex", gap: 16, marginBottom: 10, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 12.5, color: "#4ADE80" }}>✓ พร้อมนำเข้า {validRows.length} รายการ</span>
+                  {invalidCount > 0 && <span style={{ fontSize: 12.5, color: "#F87171" }}>✕ ข้ามเพราะไม่มีเลขครุภัณฑ์ {invalidCount} รายการ</span>}
+                  {unmatchedBranchCount > 0 && <span style={{ fontSize: 12.5, color: "var(--accent)" }}>⚠ ไม่พบสาขาตรงกัน {unmatchedBranchCount} รายการ (จะนำเข้าแบบยังไม่ผูกสาขา แก้ไขทีหลังได้)</span>}
+                </div>
+                <div style={{ maxHeight: 240, overflowY: "auto", border: "1px solid var(--line)", borderRadius: 8, marginBottom: 16 }}>
+                  <table>
+                    <thead><tr><th>แถว</th><th>เลขครุภัณฑ์</th><th>สาขา</th><th>สถานะ</th></tr></thead>
+                    <tbody>
+                      {(rows || []).slice(0, 200).map((r) => (
+                        <tr key={r.rowNum}>
+                          <td className="mono" style={{ color: "var(--muted)" }}>{r.rowNum}</td>
+                          <td className={!r.assetTag ? "" : "mono"} style={{ color: !r.assetTag ? "#F87171" : "var(--accent)" }}>{r.assetTag || "(ไม่มีเลขครุภัณฑ์ — ข้าม)"}</td>
+                          <td style={{ color: !r.branchId && r.branchName ? "var(--accent)" : undefined }}>{r.branchName || "-"}{!r.branchId && r.branchName ? " (ไม่พบ)" : ""}</td>
+                          <td>{r.status}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button className="btn" onClick={onClose}>ยกเลิก</button>
+              <button className="btn btn-primary" disabled={!rows || validRows.length === 0 || importing} onClick={confirmImport}>
+                {importing ? "กำลังนำเข้า…" : `นำเข้า ${validRows.length} รายการ`}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 function TicketsView({ tickets, assets, branches, branchName, assetLabel, onCreate, onStatus, onDelete, onUploadPhoto, onDeletePhoto }) {
   const [filterStatus, setFilterStatus] = useState("");
   const [modal, setModal] = useState(false);
